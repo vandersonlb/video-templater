@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Project Manager</title>
+    
+    <!-- Material Design Components -->
+    <link href="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+    <!-- App Bar -->
+    <header class="mdc-top-app-bar mdc-top-app-bar--fixed">
+        <div class="mdc-top-app-bar__row">
+            <section class="mdc-top-app-bar__section mdc-top-app-bar__section--align-start">
+                <span class="mdc-top-app-bar__title">Video Project Manager</span>
+            </section>
+            <section class="mdc-top-app-bar__section mdc-top-app-bar__section--align-end">
+                <button class="mdc-icon-button material-icons mdc-top-app-bar__action-item" onclick="refreshProjects()">
+                    refresh
+                </button>
+            </section>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="mdc-top-app-bar--fixed-adjust">
+        <div class="main-content">
+            <!-- Projects Section -->
+            <section class="projects-section">
+                <div class="section-header">
+                    <h2 class="mdc-typography--headline4">Projects</h2>
+                </div>
+                
+                <!-- Projects Grid -->
+                <div id="projects-grid" class="projects-grid">
+                    <!-- Projects will be dynamically loaded here -->
+                </div>
+                
+                <!-- Empty State -->
+                <div id="empty-state" class="empty-state" style="display: none;">
+                    <div class="empty-state-content">
+                        <i class="material-icons empty-state-icon">video_library</i>
+                        <h3 class="mdc-typography--headline5">No template pairs found</h3>
+                        <p class="mdc-typography--body1">Add .aep and .json file pairs to the /templates directory to create projects</p>
+                        <button class="mdc-button mdc-button--raised" onclick="refreshProjects()">
+                            <span class="mdc-button__label">Refresh</span>
+                        </button>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Floating Action Button for refresh -->
+        <button class="mdc-fab" id="refresh-fab" onclick="refreshProjects()">
+            <div class="mdc-fab__ripple"></div>
+            <span class="material-icons mdc-fab__icon">refresh</span>
+        </button>
+    </main>
+
+    <!-- Create Project Dialog -->
+    <div class="mdc-dialog" id="create-project-dialog">
+        <div class="mdc-dialog__container">
+            <div class="mdc-dialog__surface">
+                <div class="mdc-dialog__header">
+                    <h2 class="mdc-dialog__title">Create New Project</h2>
+                </div>
+                <div class="mdc-dialog__content">
+                    <!-- Project Name -->
+                    <div class="mdc-text-field mdc-text-field--filled project-name-field">
+                        <span class="mdc-text-field__ripple"></span>
+                        <span class="mdc-floating-label" id="project-name-label">Project Name</span>
+                        <input class="mdc-text-field__input" type="text" id="project-name-input" required>
+                        <span class="mdc-line-ripple"></span>
+                    </div>
+
+                    <!-- Template Selection -->
+                    <div class="template-selection">
+                        <h3 class="mdc-typography--headline6">Select Template</h3>
+                        <div id="templates-grid" class="templates-grid">
+                            <!-- Templates will be loaded here -->
+                        </div>
+                    </div>
+
+                    <!-- Data Columns -->
+                    <div class="data-columns-section">
+                        <h3 class="mdc-typography--headline6">Data Columns</h3>
+                        <p class="mdc-typography--body2">Define the data fields for your project</p>
+                        <div id="data-columns-container">
+                            <!-- Data columns will be added here -->
+                        </div>
+                        <button class="mdc-button mdc-button--outlined" onclick="addDataColumn()">
+                            <span class="material-icons mdc-button__icon">add</span>
+                            <span class="mdc-button__label">Add Column</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="mdc-dialog__actions">
+                    <button type="button" class="mdc-button mdc-dialog__button" data-mdc-dialog-action="cancel">
+                        <span class="mdc-button__label">Cancel</span>
+                    </button>
+                    <button type="button" class="mdc-button mdc-button--raised mdc-dialog__button" data-mdc-dialog-action="create" onclick="createProject()">
+                        <span class="mdc-button__label">Create Project</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+        <div class="mdc-dialog__scrim"></div>
+    </div>
+
+    <!-- Upload CSV Dialog -->
+    <div class="mdc-dialog" id="upload-csv-dialog">
+        <div class="mdc-dialog__container">
+            <div class="mdc-dialog__surface">
+                <div class="mdc-dialog__header">
+                    <h2 class="mdc-dialog__title">Upload Data Source</h2>
+                </div>
+                <div class="mdc-dialog__content">
+                    <p class="mdc-typography--body1">Upload a CSV file with your project data</p>
+                    <div class="file-upload-area">
+                        <input type="file" id="csv-file-input" accept=".csv" style="display: none;">
+                        <div class="file-drop-zone" onclick="document.getElementById('csv-file-input').click()">
+                            <i class="material-icons">cloud_upload</i>
+                            <p>Click to select CSV file or drag and drop</p>
+                        </div>
+                        <div id="file-info" class="file-info" style="display: none;"></div>
+                    </div>
+                </div>
+                <div class="mdc-dialog__actions">
+                    <button type="button" class="mdc-button mdc-dialog__button" data-mdc-dialog-action="cancel">
+                        <span class="mdc-button__label">Cancel</span>
+                    </button>
+                    <button type="button" class="mdc-button mdc-button--raised mdc-dialog__button" onclick="uploadCSV()" disabled id="upload-csv-btn">
+                        <span class="mdc-button__label">Upload</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+        <div class="mdc-dialog__scrim"></div>
+    </div>
+
+    <!-- Generate Videos Dialog -->
+    <div class="mdc-dialog" id="generate-videos-dialog">
+        <div class="mdc-dialog__container">
+            <div class="mdc-dialog__surface">
+                <div class="mdc-dialog__header">
+                    <h2 class="mdc-dialog__title">Generate Videos</h2>
+                </div>
+                <div class="mdc-dialog__content">
+                    <div id="generation-content">
+                        <!-- Content will be populated dynamically -->
+                    </div>
+                </div>
+                <div class="mdc-dialog__actions">
+                    <button type="button" class="mdc-button mdc-dialog__button" data-mdc-dialog-action="close">
+                        <span class="mdc-button__label">Close</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+        <div class="mdc-dialog__scrim"></div>
+    </div>
+
+    <!-- Snackbar for notifications -->
+    <div class="mdc-snackbar" id="snackbar">
+        <div class="mdc-snackbar__surface">
+            <div class="mdc-snackbar__label"></div>
+            <div class="mdc-snackbar__actions">
+                <button type="button" class="mdc-icon-button mdc-snackbar__dismiss material-icons">close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://unpkg.com/material-components-web@latest/dist/material-components-web.min.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/projects.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>

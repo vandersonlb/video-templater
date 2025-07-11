@@ -1,0 +1,25 @@
+{
+  "template": {
+    "src": "file:////home/vanderson/SANDBOX/nexrender_poc/templates/Template_02.aep",
+    "composition": "MainComp",
+    "outputModule": "H.264 - Match Render Settings - 15 Mbps",
+    "outputExt": "mp4",
+    "settingsTemplate": "Best Settings"
+  },
+    "assets": [
+    {
+      "type": "data",
+      "layerName": "title",
+      "composition": "MainComp",
+      "property": "Source Text",
+      "value": "/* Find in CSV */"
+    },
+    {
+      "type": "data",
+      "layerName": "subtitle",
+      "composition": "MainComp",
+      "property": "Source Text",
+      "value": "/* Find in CSV */"
+    }
+  ]
+}
