@@ -19,7 +19,7 @@ const job = {
     },
   ],
   onRenderProgress: (job, percents) => {
-    console.log(`XXX Render progress: ${percents}%`);
+    console.log(`${job} render progress: ${percents}%`);
   },
 };
 

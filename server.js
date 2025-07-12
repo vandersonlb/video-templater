@@ -6,8 +6,13 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const { render } = require('@nexrender/core');
+const { createServer } = require('http');
+const { Server } = require('socket.io');
+const QueueManager = require('./queue-manager');
 
 const app = express();
+const server = createServer(app);
+const io = new Server(server);
 const PORT = 8080;
 
 // NexRender configuration
@@ -15,14 +20,157 @@ const NEXRENDER_CONFIG = {
   // workpath: path.join(__dirname, 'renders'),
   workpath: "/mnt/d/Adobe/_cache_/Nexrender",
   binary: "/mnt/d/Adobe/Adobe After Effects 2025/Support Files/aerender.exe",
-  skipCleanup: true,
+  skipCleanup: false,
   addLicense: false,
   debug: true,
-  wslMap: "Z"
+  wslMap: "Z",
 };
 
-// In-memory job tracking
+// Initialize Queue Manager with configuration
+const queueManager = new QueueManager({
+  maxConcurrentRenders: 1, // Start with 1 to prevent crashes
+  maxQueueSize: 100,
+  jobTimeout: 3600000, // 1 hour
+  retryFailedJobs: true,
+  maxRetries: 2
+});
+
+// In-memory job tracking (legacy - will be replaced by queue)
 const renderJobs = new Map();
+
+// Queue event handlers
+queueManager.on('jobAdded', (job) => {
+  console.log(`Job ${job.id} added to queue`);
+  // Emit queue update to project room
+  io.to(`project-${job.metadata.projectId}`).emit('queue-update', {
+    jobId: job.id,
+    status: 'pending',
+    queuePosition: queueManager.getJobPosition(job.id),
+    queueStatus: queueManager.getQueueStatus()
+  });
+});
+
+queueManager.on('jobStarted', (job) => {
+  console.log(`Job ${job.id} started processing`);
+  // Update legacy tracking for compatibility
+  renderJobs.set(job.id, {
+    id: job.id,
+    projectId: job.metadata.projectId,
+    templateId: job.metadata.templateId,
+    rowData: job.metadata.rowData,
+    rowIndex: job.metadata.rowIndex,
+    status: 'processing',
+    outputPath: job.metadata.outputPath,
+    outputFilename: job.metadata.outputFilename,
+    startTime: job.metadata.startedAt,
+    config: job,
+    progress: 0
+  });
+  
+  // Emit status update
+  io.to(`project-${job.metadata.projectId}`).emit('job-started', {
+    jobId: job.id,
+    status: 'processing',
+    queueStatus: queueManager.getQueueStatus()
+  });
+});
+
+queueManager.on('processJob', async (job) => {
+  // This is where we actually start the render process
+  try {
+    await renderVideoFromQueue(job);
+  } catch (error) {
+    console.error(`Failed to process job ${job.id}:`, error);
+    queueManager.failJob(job.id, error);
+  }
+});
+
+queueManager.on('jobCompleted', (job) => {
+  console.log(`Job ${job.id} completed`);
+  // Update legacy tracking
+  const legacyJob = renderJobs.get(job.id);
+  if (legacyJob) {
+    legacyJob.status = 'completed';
+    legacyJob.progress = 100;
+    legacyJob.endTime = job.metadata.completedAt;
+    legacyJob.result = job.metadata.result;
+    legacyJob.resultPath = job.metadata.result;
+  }
+  
+  // Emit completion event
+  io.to(`project-${job.metadata.projectId}`).emit('job-completed', {
+    jobId: job.id,
+    progress: 100,
+    status: 'completed',
+    resultPath: job.metadata.result,
+    downloadUrl: job.metadata.result && fs.existsSync(job.metadata.result) ? `/api/download-video/${job.id}` : null,
+    queueStatus: queueManager.getQueueStatus()
+  });
+});
+
+queueManager.on('jobFailed', (job) => {
+  console.log(`Job ${job.id} failed permanently`);
+  // Update legacy tracking
+  const legacyJob = renderJobs.get(job.id);
+  if (legacyJob) {
+    legacyJob.status = 'failed';
+    legacyJob.progress = 0;
+    legacyJob.error = job.metadata.error;
+    legacyJob.errorDetails = job.metadata.errorDetails;
+    legacyJob.endTime = job.metadata.failedAt;
+  }
+  
+  // Emit failure event
+  io.to(`project-${job.metadata.projectId}`).emit('job-failed', {
+    jobId: job.id,
+    progress: 0,
+    status: 'failed',
+    error: job.metadata.error,
+    errorDetails: job.metadata.errorDetails,
+    queueStatus: queueManager.getQueueStatus()
+  });
+});
+
+queueManager.on('jobRetry', (job) => {
+  console.log(`Job ${job.id} will be retried`);
+  // Emit retry event
+  io.to(`project-${job.metadata.projectId}`).emit('job-retry', {
+    jobId: job.id,
+    status: 'pending',
+    retryCount: job.metadata.retryCount,
+    queuePosition: queueManager.getJobPosition(job.id),
+    queueStatus: queueManager.getQueueStatus()
+  });
+});
+
+// WebSocket connection handling
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+  
+  // Join project room for targeted updates
+  socket.on('join-project', (projectId) => {
+    socket.join(`project-${projectId}`);
+    console.log(`Client ${socket.id} joined project room: ${projectId}`);
+    
+    // Send current queue status for this project
+    const projectJobs = queueManager.getProjectJobs(projectId);
+    socket.emit('project-queue-status', {
+      projectId: projectId,
+      jobs: projectJobs,
+      queueStatus: queueManager.getQueueStatus()
+    });
+  });
+  
+  // Leave project room
+  socket.on('leave-project', (projectId) => {
+    socket.leave(`project-${projectId}`);
+    console.log(`Client ${socket.id} left project room: ${projectId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+  });
+});
 
 // Middleware
 app.use(express.static('public'));
@@ -213,9 +361,9 @@ app.get('/api/download-csv/:projectId', (req, res) => {
   }
 });
 
-// Generate videos endpoint (now actually renders videos)
+// Generate videos endpoint (now uses queue system)
 app.post('/api/generate-videos', async (req, res) => {
-  const { projectId, templateId, csvData } = req.body;
+  const { projectId, templateId, csvData, priority } = req.body;
   
   try {
     // Read the template file
@@ -233,16 +381,24 @@ app.post('/api/generate-videos', async (req, res) => {
       fs.mkdirSync(projectRenderDir, { recursive: true });
     }
     
-    // Start rendering each CSV row
+    // Add each CSV row as a job to the queue
     for (let index = 0; index < csvData.length; index++) {
       const row = csvData[index];
       const jobId = `${projectId}_${index + 1}_${uuidv4()}`;
       const renderJob = JSON.parse(JSON.stringify(templateData)); // Deep copy
       
+      // Ensure template.src points to the correct .aep file
+      const aepPath = path.join(__dirname, 'templates', `${templateId}.aep`);
+      const absoluteAepPath = path.resolve(aepPath);
+      renderJob.template.src = `file://${absoluteAepPath}`;
+      
       // Update data assets with CSV values
       renderJob.assets.forEach(asset => {
         if (asset.type === 'data' && asset.layerName && row[asset.layerName]) {
           asset.value = row[asset.layerName];
+        }
+        if (asset.type === 'image' && asset.layerName && row[asset.layerName]) {
+          asset.src = row[asset.layerName];
         }
       });
       
@@ -250,37 +406,46 @@ app.post('/api/generate-videos', async (req, res) => {
       const outputFilename = `${jobId}.${templateData.template.outputExt || 'mp4'}`;
       const outputPath = path.join(projectRenderDir, outputFilename);
       
-      // Store job info
-      const jobInfo = {
-        id: jobId,
-        projectId: projectId,
-        templateId: templateId,
-        rowData: row,
-        rowIndex: index + 1,
-        status: 'rendering',
-        outputPath: outputPath,
-        outputFilename: outputFilename,
-        startTime: new Date().toISOString(),
-        config: renderJob
-      };
+      // Add postrender action to copy files to output directory
+      if (!renderJob.actions) {
+        renderJob.actions = {};
+      }
+      if (!renderJob.actions.postrender) {
+        renderJob.actions.postrender = [];
+      }
       
-      renderJobs.set(jobId, jobInfo);
-      jobs.push({
-        id: jobId,
-        status: 'rendering',
-        rowData: row,
-        rowIndex: index + 1
+      // Add copy action to move rendered files to the specified output directory
+      renderJob.actions.postrender.push({
+        "module": "@nexrender/action-copy",
+        "output": "/mnt/c/Users/vande/Downloads/Renderizados/",
+        "useJobId": "true"
       });
       
-      // Start async rendering (don't await - render in background)
-      renderVideo(jobId, renderJob, outputPath).catch(error => {
-        console.error(`Render failed for job ${jobId}:`, error);
-        const job = renderJobs.get(jobId);
-        if (job) {
-          job.status = 'failed';
-          job.error = error.message;
-          job.endTime = new Date().toISOString();
-        }
+      // Create job configuration for queue
+      const jobConfig = {
+        id: jobId,
+        priority: priority || 0, // Support priority from request
+        template: renderJob.template,
+        assets: renderJob.assets,
+        actions: renderJob.actions,
+        projectId: projectId,
+        templateId: templateId,
+        rowIndex: index + 1,
+        rowData: row,
+        outputPath: outputPath,
+        outputFilename: outputFilename
+      };
+      
+      // Add job to queue
+      const queuedJob = queueManager.addJob(jobConfig);
+      
+      jobs.push({
+        id: jobId,
+        status: 'pending',
+        rowData: row,
+        rowIndex: index + 1,
+        queuePosition: queueManager.getJobPosition(jobId),
+        priority: queuedJob.priority
       });
     }
     
@@ -288,19 +453,64 @@ app.post('/api/generate-videos', async (req, res) => {
       success: true,
       jobCount: jobs.length,
       jobs: jobs,
-      message: 'Video rendering started. Check status with /api/render-status/:projectId'
+      queueStatus: queueManager.getQueueStatus(),
+      message: `${jobs.length} jobs added to render queue. Check status with /api/render-status/:projectId`
     });
     
   } catch (error) {
-    console.error('Error starting video generation:', error);
-    res.status(500).json({ error: 'Failed to start video generation' });
+    console.error('Error adding jobs to queue:', error);
+    res.status(500).json({ error: 'Failed to add jobs to render queue' });
   }
 });
 
-// Async function to render a single video with progress tracking
+// New function to render video from queue job
+async function renderVideoFromQueue(job) {
+  try {
+    console.log(`Starting render for queued job ${job.id}`);
+    
+    // Create nexrender job configuration
+    const nexrenderJob = {
+      template: job.template,
+      assets: job.assets,
+      actions: job.actions
+    };
+    
+    // Add progress tracking
+    nexrenderJob.onRenderProgress = (renderJob, percents) => {
+      console.log(`Job ${job.id} render progress: ${percents}%`);
+      
+      // Update legacy tracking for compatibility
+      const legacyJob = renderJobs.get(job.id);
+      if (legacyJob) {
+        legacyJob.progress = Math.round(percents);
+      }
+      
+      // Emit real-time progress update via WebSocket
+      io.to(`project-${job.metadata.projectId}`).emit('progress-update', {
+        jobId: job.id,
+        progress: Math.round(percents),
+        status: 'processing'
+      });
+    };
+    
+    console.log(`Rendering job ${job.id} with template: ${job.template.src}`);
+    
+    const result = await render(nexrenderJob, NEXRENDER_CONFIG);
+    
+    console.log(`Render completed for job ${job.id}: ${result}`);
+    console.log(`Result file exists: ${fs.existsSync(result)}`);
+    
+    // Complete the job in queue
+    queueManager.completeJob(job.id, result);
+    
+  } catch (error) {
+    console.error(`Render failed for job ${job.id}:`, error);
+    throw error; // This will be caught by the queue manager
+  }
+}
+
+// Async function to render a single video with progress tracking (legacy)
 async function renderVideo(jobId, jobConfig, outputPath) {
-  let progressInterval;
-  
   try {
     console.log(`Starting render for job ${jobId}`);
     
@@ -308,44 +518,34 @@ async function renderVideo(jobId, jobConfig, outputPath) {
     const job = renderJobs.get(jobId);
     if (job) {
       job.progress = 0;
-      job.lastProgressUpdate = Date.now();
     }
     
-    // Fallback progress tracking if onProgress doesn't work
-    let fallbackProgress = 0;
-    progressInterval = setInterval(() => {
+    // Add onRenderProgress to the job configuration (correct NexRender approach)
+    jobConfig.onRenderProgress = (job, percents) => {
       const currentJob = renderJobs.get(jobId);
-      if (currentJob && currentJob.status === 'rendering') {
-        // If no progress update from onProgress callback, use fallback
-        const timeSinceStart = Date.now() - new Date(currentJob.startTime).getTime();
-        const estimatedDuration = 60000; // Estimate 60 seconds per render
-        fallbackProgress = Math.min(95, Math.round((timeSinceStart / estimatedDuration) * 100));
+      if (currentJob) {
+        currentJob.progress = Math.round(percents);
+        console.log(`Job ${jobId} render progress: ${percents}%`);
         
-        // Only update if we haven't received real progress updates recently
-        const timeSinceLastUpdate = Date.now() - (currentJob.lastProgressUpdate || 0);
-        if (timeSinceLastUpdate > 5000) { // 5 seconds without real progress
-          currentJob.progress = fallbackProgress;
-          console.log(`Job ${jobId} fallback progress: ${fallbackProgress}%`);
-        }
+        // Emit real-time progress update via WebSocket
+        io.to(`project-${currentJob.projectId}`).emit('progress-update', {
+          jobId: jobId,
+          progress: currentJob.progress,
+          status: 'rendering'
+        });
       }
-    }, 2000); // Update every 2 seconds
+    };
     
-    const result = await render(jobConfig, {
-      ...NEXRENDER_CONFIG,
-      onProgress: (progress) => {
-        const currentJob = renderJobs.get(jobId);
-        if (currentJob) {
-          currentJob.progress = Math.round(progress * 100);
-          currentJob.lastProgressUpdate = Date.now();
-          console.log(`Job ${jobId} real progress: ${currentJob.progress}%`);
-        }
-      }
-    });
-    
-    // Clear progress interval
-    if (progressInterval) {
-      clearInterval(progressInterval);
+    // Ensure template.src uses file:// protocol for local files
+    if (jobConfig.template && jobConfig.template.src && !jobConfig.template.src.startsWith('file://')) {
+      // Convert relative path to absolute file:// URL
+      const absolutePath = path.resolve(jobConfig.template.src);
+      jobConfig.template.src = `file://${absolutePath}`;
     }
+    
+    console.log(`Rendering job ${jobId} with template: ${jobConfig.template.src}`);
+    
+    const result = await render(jobConfig, NEXRENDER_CONFIG);
     
     // Update job status
     const finalJob = renderJobs.get(jobId);
@@ -358,15 +558,19 @@ async function renderVideo(jobId, jobConfig, outputPath) {
       
       console.log(`Render completed for job ${jobId}: ${result}`);
       console.log(`Result file exists: ${fs.existsSync(result)}`);
+      
+      // Emit completion event via WebSocket
+      io.to(`project-${finalJob.projectId}`).emit('job-completed', {
+        jobId: jobId,
+        progress: 100,
+        status: 'completed',
+        resultPath: result,
+        downloadUrl: fs.existsSync(result) ? `/api/download-video/${jobId}` : null
+      });
     }
     
   } catch (error) {
     console.error(`Render failed for job ${jobId}:`, error);
-    
-    // Clear progress interval
-    if (progressInterval) {
-      clearInterval(progressInterval);
-    }
     
     const job = renderJobs.get(jobId);
     if (job) {
@@ -375,6 +579,15 @@ async function renderVideo(jobId, jobConfig, outputPath) {
       job.error = error.message;
       job.errorDetails = error.stack || error.toString();
       job.endTime = new Date().toISOString();
+      
+      // Emit failure event via WebSocket
+      io.to(`project-${job.projectId}`).emit('job-failed', {
+        jobId: jobId,
+        progress: 0,
+        status: 'failed',
+        error: error.message,
+        errorDetails: job.errorDetails
+      });
     }
     throw error;
   }
@@ -485,13 +698,17 @@ app.get('/api/project-videos/:projectId', (req, res) => {
     
     renderJobs.forEach((job, jobId) => {
       if (job.projectId === projectId && job.status === 'completed') {
+        // Use the actual result path for file size calculation
+        const filePath = job.resultPath || job.outputPath;
+        const fileSize = (filePath && fs.existsSync(filePath)) ? fs.statSync(filePath).size : 0;
+        
         completedJobs.push({
           id: job.id,
           rowIndex: job.rowIndex,
           outputFilename: job.outputFilename,
           downloadUrl: `/api/download-video/${job.id}`,
           rowData: job.rowData,
-          fileSize: fs.existsSync(job.outputPath) ? fs.statSync(job.outputPath).size : 0
+          fileSize: fileSize
         });
       }
     });
@@ -514,7 +731,7 @@ app.delete('/api/project-data/:projectId', (req, res) => {
   const projectId = req.params.projectId;
   
   try {
-    // Remove all render jobs for this project
+    // Remove all render jobs for this project from legacy tracking
     const deletedJobs = [];
     renderJobs.forEach((job, jobId) => {
       if (job.projectId === projectId) {
@@ -523,11 +740,26 @@ app.delete('/api/project-data/:projectId', (req, res) => {
       }
     });
     
+    // Also remove from queue (pending jobs only)
+    const queueJobs = queueManager.getProjectJobs(projectId);
+    let cancelledJobs = 0;
+    queueJobs.forEach(job => {
+      if (job.status === 'pending') {
+        try {
+          queueManager.cancelJob(job.id);
+          cancelledJobs++;
+        } catch (error) {
+          console.warn(`Could not cancel job ${job.id}:`, error.message);
+        }
+      }
+    });
+    
     res.json({
       success: true,
       projectId: projectId,
       message: `Cleared data for project ${projectId}`,
-      deletedJobs: deletedJobs.length
+      deletedJobs: deletedJobs.length,
+      cancelledJobs: cancelledJobs
     });
     
   } catch (error) {
@@ -536,9 +768,157 @@ app.delete('/api/project-data/:projectId', (req, res) => {
   }
 });
 
-// Start server
-app.listen(PORT, () => {
+// ===== NEW QUEUE MANAGEMENT ENDPOINTS =====
+
+// Get overall queue status
+app.get('/api/queue/status', (req, res) => {
+  try {
+    const queueStatus = queueManager.getQueueStatus();
+    res.json({
+      success: true,
+      queueStatus: queueStatus
+    });
+  } catch (error) {
+    console.error('Error getting queue status:', error);
+    res.status(500).json({ error: 'Failed to get queue status' });
+  }
+});
+
+// Get queue status for a specific project
+app.get('/api/queue/project/:projectId', (req, res) => {
+  const projectId = req.params.projectId;
+  
+  try {
+    const projectJobs = queueManager.getProjectJobs(projectId);
+    const queueStatus = queueManager.getQueueStatus();
+    
+    // Add queue positions for pending jobs
+    const jobsWithPositions = projectJobs.map(job => ({
+      ...job,
+      queuePosition: job.status === 'pending' ? queueManager.getJobPosition(job.id) : null
+    }));
+    
+    res.json({
+      success: true,
+      projectId: projectId,
+      jobs: jobsWithPositions,
+      queueStatus: queueStatus
+    });
+    
+  } catch (error) {
+    console.error('Error getting project queue status:', error);
+    res.status(500).json({ error: 'Failed to get project queue status' });
+  }
+});
+
+// Update job priority (only for pending jobs)
+app.post('/api/queue/priority/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  const { priority } = req.body;
+  
+  if (typeof priority !== 'number') {
+    return res.status(400).json({ error: 'Priority must be a number' });
+  }
+  
+  try {
+    const updatedJob = queueManager.updateJobPriority(jobId, priority);
+    
+    res.json({
+      success: true,
+      jobId: jobId,
+      newPriority: updatedJob.priority,
+      newQueuePosition: queueManager.getJobPosition(jobId),
+      queueStatus: queueManager.getQueueStatus()
+    });
+    
+  } catch (error) {
+    console.error('Error updating job priority:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Cancel a pending job
+app.delete('/api/queue/job/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  
+  try {
+    const cancelledJob = queueManager.cancelJob(jobId);
+    
+    // Also remove from legacy tracking if exists
+    renderJobs.delete(jobId);
+    
+    res.json({
+      success: true,
+      jobId: jobId,
+      message: 'Job cancelled successfully',
+      queueStatus: queueManager.getQueueStatus()
+    });
+    
+  } catch (error) {
+    console.error('Error cancelling job:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Update queue configuration
+app.post('/api/queue/config', (req, res) => {
+  const { maxConcurrentRenders } = req.body;
+  
+  try {
+    if (maxConcurrentRenders && typeof maxConcurrentRenders === 'number' && maxConcurrentRenders > 0) {
+      queueManager.config.maxConcurrentRenders = maxConcurrentRenders;
+      console.log(`Queue max concurrent renders updated to: ${maxConcurrentRenders}`);
+    }
+    
+    res.json({
+      success: true,
+      config: {
+        maxConcurrentRenders: queueManager.config.maxConcurrentRenders,
+        maxQueueSize: queueManager.config.maxQueueSize,
+        jobTimeout: queueManager.config.jobTimeout,
+        retryFailedJobs: queueManager.config.retryFailedJobs,
+        maxRetries: queueManager.config.maxRetries
+      },
+      queueStatus: queueManager.getQueueStatus()
+    });
+    
+  } catch (error) {
+    console.error('Error updating queue config:', error);
+    res.status(500).json({ error: 'Failed to update queue configuration' });
+  }
+});
+
+// Get queue configuration
+app.get('/api/queue/config', (req, res) => {
+  try {
+    res.json({
+      success: true,
+      config: {
+        maxConcurrentRenders: queueManager.config.maxConcurrentRenders,
+        maxQueueSize: queueManager.config.maxQueueSize,
+        jobTimeout: queueManager.config.jobTimeout,
+        retryFailedJobs: queueManager.config.retryFailedJobs,
+        maxRetries: queueManager.config.maxRetries
+      },
+      queueStatus: queueManager.getQueueStatus()
+    });
+  } catch (error) {
+    console.error('Error getting queue config:', error);
+    res.status(500).json({ error: 'Failed to get queue configuration' });
+  }
+});
+
+// Start server (using HTTP server for WebSocket support)
+server.listen(PORT, () => {
   console.log(`Video Project Manager running at http://localhost:${PORT}`);
+  console.log('WebSocket server enabled for real-time progress updates');
+  console.log('Queue system initialized with configuration:');
+  console.log(`  - Max concurrent renders: ${queueManager.config.maxConcurrentRenders}`);
+  console.log(`  - Max queue size: ${queueManager.config.maxQueueSize}`);
+  console.log(`  - Job timeout: ${queueManager.config.jobTimeout / 1000}s`);
+  console.log(`  - Retry failed jobs: ${queueManager.config.retryFailedJobs}`);
+  console.log(`  - Max retries: ${queueManager.config.maxRetries}`);
+  
   try {
     const files = fs.readdirSync('templates');
     const aepFiles = files.filter(f => f.endsWith('.aep'));
@@ -550,4 +930,9 @@ app.listen(PORT, () => {
   } catch (error) {
     console.log('Templates directory not found or empty');
   }
+  
+  console.log('\n=== QUEUE SYSTEM ACTIVE ===');
+  console.log('Videos will now render sequentially to prevent system crashes.');
+  console.log('Use /api/queue/config to adjust concurrent render limit.');
+  console.log('Monitor queue status at /api/queue/status');
 });

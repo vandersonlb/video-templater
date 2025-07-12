@@ -10,10 +10,23 @@
     {
       "type": "data",
       "layerName": "text",
-      "composition": "MainComp",
       "property": "Source Text",
       "value": "Lorem ipsum"
+    },
+    {
+      "type": "image",
+      "layerName": "image",
+      "src": "file:///home/vanderson/SANDBOX/nexrender_poc/templates/images/o_latido.png",
+      "extension": "png"
     }
   ],
-  "onRenderProgress": "function(job, percents) { console.log(`XXX Render progress: ${percents}%`); }"
+    "actions": {
+    "postrender": [
+      {
+        "module": "@nexrender/action-copy",
+        "output": "/mnt/c/Users/vande/Downloads/NexRender/04_results/",
+        "useJobId": "true"
+      }
+    ]
+  }
 }

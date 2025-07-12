@@ -6,10 +6,15 @@ let uploadCSVDialog;
 let generateVideosDialog;
 let projectNameField;
 let currentUploadProjectId = null;
+let socket = null;
+let currentProjectId = null;
 
 // Initialize application
 document.addEventListener('DOMContentLoaded', async function() {
     console.log('Video Project Manager initializing...');
+    
+    // Initialize WebSocket connection
+    initializeWebSocket();
     
     // Initialize Material Design Components
     initializeMDCComponents();
@@ -25,6 +30,153 @@ document.addEventListener('DOMContentLoaded', async function() {
     
     console.log('Application initialized successfully');
 });
+
+// Initialize WebSocket connection
+function initializeWebSocket() {
+    socket = io();
+    
+    socket.on('connect', () => {
+        console.log('WebSocket connected:', socket.id);
+    });
+    
+    socket.on('disconnect', () => {
+        console.log('WebSocket disconnected');
+    });
+    
+    // Real-time progress updates
+    socket.on('progress-update', (data) => {
+        console.log('Progress update:', data);
+        updateJobProgress(data.jobId, data.progress, data.status);
+    });
+    
+    // Job completion events
+    socket.on('job-completed', (data) => {
+        console.log('Job completed:', data);
+        updateJobCompletion(data.jobId, data);
+    });
+    
+    // Job failure events
+    socket.on('job-failed', (data) => {
+        console.log('Job failed:', data);
+        updateJobFailure(data.jobId, data);
+    });
+}
+
+// Join project room for real-time updates
+function joinProjectRoom(projectId) {
+    if (socket && socket.connected) {
+        currentProjectId = projectId;
+        socket.emit('join-project', projectId);
+        console.log(`Joined project room: ${projectId}`);
+    }
+}
+
+// Leave project room
+function leaveProjectRoom() {
+    if (socket && socket.connected && currentProjectId) {
+        socket.emit('leave-project', currentProjectId);
+        console.log(`Left project room: ${currentProjectId}`);
+        currentProjectId = null;
+    }
+}
+
+// Update job progress in real-time
+function updateJobProgress(jobId, progress, status) {
+    const jobElement = document.getElementById(`job-${jobId}`);
+    if (jobElement) {
+        const statusElement = jobElement.querySelector('.job-status');
+        statusElement.className = 'job-status rendering';
+        statusElement.innerHTML = `
+            <div class="render-progress">
+                <span class="status-text">Rendering... ${progress}%</span>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: ${progress}%"></div>
+                </div>
+            </div>
+        `;
+    }
+}
+
+// Update job completion in real-time
+function updateJobCompletion(jobId, data) {
+    const jobElement = document.getElementById(`job-${jobId}`);
+    if (jobElement) {
+        const statusElement = jobElement.querySelector('.job-status');
+        statusElement.className = 'job-status completed';
+        
+        const downloadButton = data.downloadUrl ? `
+            <button class="mdc-button mdc-button--dense" onclick="downloadVideo('${jobId}', '${data.outputFilename || 'video.mp4'}')">
+                <span class="mdc-button__label">Download</span>
+            </button>
+        ` : `
+            <span class="file-not-found">File not found</span>
+        `;
+        
+        statusElement.innerHTML = `
+            <span class="status-text">Completed (100%)</span>
+            ${downloadButton}
+        `;
+    }
+    
+    // Update summary counters
+    updateSummaryCounters();
+}
+
+// Update job failure in real-time
+function updateJobFailure(jobId, data) {
+    const jobElement = document.getElementById(`job-${jobId}`);
+    if (jobElement) {
+        const statusElement = jobElement.querySelector('.job-status');
+        statusElement.className = 'job-status failed';
+        statusElement.innerHTML = `
+            <span class="status-text">Failed</span>
+            <div class="error-details">
+                <span class="error-text">${data.error || 'Unknown error'}</span>
+                ${data.errorDetails ? `<details class="error-details-expand">
+                    <summary>Show details</summary>
+                    <pre class="error-stack">${escapeHtml(data.errorDetails)}</pre>
+                </details>` : ''}
+            </div>
+        `;
+    }
+    
+    // Update summary counters
+    updateSummaryCounters();
+}
+
+// Update summary counters based on current job states
+function updateSummaryCounters() {
+    const jobElements = document.querySelectorAll('.generation-job');
+    let completed = 0, rendering = 0, failed = 0;
+    
+    jobElements.forEach(jobElement => {
+        const statusElement = jobElement.querySelector('.job-status');
+        if (statusElement.classList.contains('completed')) {
+            completed++;
+        } else if (statusElement.classList.contains('failed')) {
+            failed++;
+        } else if (statusElement.classList.contains('rendering')) {
+            rendering++;
+        }
+    });
+    
+    // Update summary display
+    const completedElement = document.getElementById('progress-completed');
+    const renderingElement = document.getElementById('progress-rendering');
+    const failedElement = document.getElementById('progress-failed');
+    
+    if (completedElement) completedElement.textContent = completed;
+    if (renderingElement) renderingElement.textContent = rendering;
+    if (failedElement) failedElement.textContent = failed;
+    
+    // Enable download all button if there are completed videos and no rendering jobs
+    if (rendering === 0 && completed > 0) {
+        const downloadAllBtn = document.getElementById('download-all-btn');
+        if (downloadAllBtn) {
+            downloadAllBtn.disabled = false;
+        }
+    }
+}
 
 // Initialize Material Design Components
 function initializeMDCComponents() {
@@ -343,8 +495,9 @@ function displayGenerationResults(result) {
         </div>
     `;
     
-    // Start polling for status updates
+    // Start polling for status updates and join WebSocket room
     const projectId = result.jobs[0].id.split('_')[0];
+    joinProjectRoom(projectId);
     startStatusPolling(projectId);
 }
 
